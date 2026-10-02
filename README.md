@@ -14,6 +14,11 @@ flowchart LR
 
 ## What you get in Home Assistant
 
+<img width="1503" height="663" alt="image" src="https://github.com/user-attachments/assets/cfaff380-af47-4154-8e55-58083f70730a" />
+
+<img width="601" height="955" alt="image" src="https://github.com/user-attachments/assets/18c16cbf-14b1-402e-b3c5-34c28dc7b3d7" />
+
+
 MQTT discovery adds one device, "SidePulse <Mac name>", with three entities:
 
 | Entity | Type | What it shows |
