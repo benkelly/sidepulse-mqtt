@@ -1,0 +1,54 @@
+blueprint:
+  name: SidePulse alert
+  description: >-
+    Play an LED program on a SidePulse device for some seconds when a trigger
+    fires, for example when a doorbell rings. Then the device shows live agent
+    status again. Needs the sidepulse-mqtt bridge:
+    https://github.com/benkelly/sidepulse-mqtt
+  domain: automation
+  source_url: https://github.com/benkelly/sidepulse-mqtt/blob/main/blueprints/automation/sidepulse_alert.yaml
+  input:
+    alert_trigger:
+      name: When
+      description: The trigger for the alert, for example a doorbell press.
+      selector:
+        trigger: {}
+    leds:
+      name: SidePulse LEDs
+      description: The LEDs light of the SidePulse device.
+      selector:
+        entity:
+          filter:
+            - integration: mqtt
+              domain: light
+    program:
+      name: LED program
+      description: >-
+        The program to play. The LED language is in LEDS_FORMAT.md in
+        inteliwear/sidepulse. A program has at most 512 bytes and 20 lines.
+      default: "off\n#0080FF 0.5s pulse\nrepeat\n"
+      selector:
+        text:
+          multiline: true
+    seconds:
+      name: Duration
+      description: The time that the alert plays. Then the device shows live status again.
+      default: 8
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: s
+
+triggers: !input alert_trigger
+
+variables:
+  leds: !input leds
+  program: !input program
+  seconds: !input seconds
+
+actions:
+  - action: mqtt.publish
+    data:
+      topic: "{{ state_attr(leds, 'show_topic') }}"
+      payload: "{{ {'program': program, 'seconds': seconds} | to_json }}"

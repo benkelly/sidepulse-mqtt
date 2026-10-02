@@ -1,0 +1,48 @@
+blueprint:
+  name: SidePulse agent waits
+  description: >-
+    Send a notification to a phone when a SidePulse agent waits for your input
+    for some time. Needs the sidepulse-mqtt bridge:
+    https://github.com/benkelly/sidepulse-mqtt
+  domain: automation
+  source_url: https://github.com/benkelly/sidepulse-mqtt/blob/main/blueprints/automation/sidepulse_agent_waits.yaml
+  input:
+    needs_input:
+      name: Needs input sensor
+      description: The Needs input binary sensor of the SidePulse device.
+      selector:
+        entity:
+          filter:
+            - integration: mqtt
+              domain: binary_sensor
+    wait_time:
+      name: Wait time
+      description: Send the notification only after the agent waits for this time.
+      default:
+        minutes: 2
+      selector:
+        duration: {}
+    phone:
+      name: Phone
+      description: The phone with the Home Assistant app.
+      selector:
+        device:
+          filter:
+            - integration: mobile_app
+    message:
+      name: Message
+      default: An agent on the Mac waits for your input.
+      selector:
+        text: {}
+
+triggers:
+  - trigger: state
+    entity_id: !input needs_input
+    to: "on"
+    for: !input wait_time
+
+actions:
+  - domain: mobile_app
+    type: notify
+    device_id: !input phone
+    message: !input message

@@ -282,7 +282,9 @@ def main() -> int:
             publish(LIGHT_AVAILABILITY, "online" if device else "offline")
             if device:
                 publish(LIGHT, json.dumps(light_state(device[0], animations), sort_keys=True))
-                publish(LIGHT_ATTRIBUTES, json.dumps({"program": device[0]}))
+                # Blueprints read show_topic, so users pick the light, not a topic.
+                attributes = {"program": device[0], "show_topic": SHOW}
+                publish(LIGHT_ATTRIBUTES, json.dumps(attributes))
         time.sleep(POLL_SECONDS)
 
 

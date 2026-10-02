@@ -130,7 +130,8 @@ try:
             "effect": "Cyan Roll"}
     wait("light mirrors the device: cyan, Cyan Roll",
          lambda: last(bridge.LIGHT_AVAILABILITY) == "online" and light() == cyan)
-    assert json.loads(last(bridge.LIGHT_ATTRIBUTES))["program"] == device.read_text()
+    attributes = json.loads(last(bridge.LIGHT_ATTRIBUTES))
+    assert attributes == {"program": device.read_text(), "show_topic": bridge.SHOW}, attributes
 
     show = {"program": "#00FF00 1s pulse", "seconds": 3}
     publisher.publish(bridge.SHOW, json.dumps(show), qos=1).wait_for_publish()

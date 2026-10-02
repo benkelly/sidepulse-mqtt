@@ -25,7 +25,7 @@ MQTT discovery adds one device, "SidePulse <Mac name>", with three entities:
 | --- | --- | --- |
 | Agent status | Sensor | Idle, Working, Ask, or Done, as in the SidePulse menu |
 | Needs input | Binary sensor | On while an agent waits for you |
-| LEDs | Light | The colour and the animation on the device. The `program` attribute holds the full LED program. |
+| LEDs | Light | The colour and the animation on the device. The `program` attribute holds the full LED program, and `show_topic` holds the topic for alerts. |
 
 Use the LEDs light to control the device:
 
@@ -91,9 +91,35 @@ A plain-text alert is the LED program itself, and it plays for 10 s. An alert la
 
 The bridge ignores retained messages on `show` and `light/set`. An old command therefore does not play again after a restart.
 
-## Examples
+## Blueprints
 
-Show a doorbell alert on the device:
+Import the two blueprints. Then create an automation from each one in Settings → Automations & scenes → Blueprints. You pick the entities in the UI.
+
+| Blueprint | What it does | Import |
+| --- | --- | --- |
+| SidePulse alert | Plays an LED program for some seconds when a trigger fires, for example a doorbell. You pick the trigger, the SidePulse LEDs light, the program, and the duration. | [![Import the SidePulse alert blueprint](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fbenkelly%2Fsidepulse-mqtt%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fsidepulse_alert.yaml) |
+| SidePulse agent waits | Sends a notification to your phone when an agent waits for your input for some time. You pick the Needs input sensor, the wait time, and the phone. | [![Import the SidePulse agent waits blueprint](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https%3A%2F%2Fgithub.com%2Fbenkelly%2Fsidepulse-mqtt%2Fblob%2Fmain%2Fblueprints%2Fautomation%2Fsidepulse_agent_waits.yaml) |
+
+## Dashboard card
+
+In a dashboard, select Edit, then Add card, then Manual. Paste this YAML, and replace `sidepulse_my_macbook` with your node:
+
+```yaml
+type: vertical-stack
+cards:
+  - type: tile
+    entity: light.sidepulse_my_macbook_leds
+  - type: entities
+    entities:
+      - sensor.sidepulse_my_macbook_agent_status
+      - binary_sensor.sidepulse_my_macbook_needs_input
+```
+
+Select the tile to open the colour and effect controls.
+
+## Write your own automation
+
+Publish an alert with `mqtt.publish`. The `show_topic` attribute of the LEDs light gives the topic:
 
 ```yaml
 - alias: Doorbell on SidePulse
@@ -104,26 +130,11 @@ Show a doorbell alert on the device:
   actions:
     - action: mqtt.publish
       data:
-        topic: sidepulse/sidepulse_my_macbook/show
+        topic: "{{ state_attr('light.sidepulse_my_macbook_leds', 'show_topic') }}"
         payload: '{"program": "off\n#0080FF 0.5s pulse\nrepeat\n", "seconds": 8}'
 ```
 
-Send a notification when an agent waits for two minutes:
-
-```yaml
-- alias: Agent waits for me
-  triggers:
-    - trigger: state
-      entity_id: binary_sensor.sidepulse_my_macbook_needs_input
-      to: "on"
-      for: "00:02:00"
-  actions:
-    - action: notify.notify
-      data:
-        message: An agent on the Mac waits for your input.
-```
-
-Replace the entity IDs and the topic with your own. Find them in Settings → Devices & services → MQTT.
+Replace the entity IDs with your own. Find them in Settings → Devices & services → MQTT.
 
 ## Troubleshooting
 
