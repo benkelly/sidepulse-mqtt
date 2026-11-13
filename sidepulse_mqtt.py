@@ -3,24 +3,28 @@
 # requires-python = ">=3.10"
 # dependencies = ["paho-mqtt>=2,<3"]
 # ///
-"""Bridge the SidePulse status-bar app on this Mac to Home Assistant over MQTT.
+"""Bridge the SidePulse service on this Mac to Home Assistant over MQTT.
 
-Publishes the agent status and the device LEDs with MQTT discovery. Passes show
-requests and light commands from MQTT to the app socket. Settings come from
+Publishes the agent status and the device LEDs with MQTT discovery. Passes
+alerts and light commands from MQTT to the SidePulse service. Settings come from
 environment variables: MQTT_HOST (required), MQTT_PORT, MQTT_USERNAME,
-MQTT_PASSWORD, SIDEPULSE_STATE_DIR, SIDEPULSE_VOLUMES, SIDEPULSE_ANIMATIONS_DIR.
+MQTT_PASSWORD, SIDEPULSE_STATE_DIR, SIDEPULSE_VOLUMES, SIDEPULSE_ANIMATIONS_DIR,
+SIDEPULSE_HOLD_SECONDS.
 """
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 import re
 import socket
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import paho.mqtt.client as mqtt
 
@@ -41,6 +45,14 @@ STATUSES = ["Idle", "Working", "Ask", "Done"]
 POLL_SECONDS = 5
 STALE_SECONDS = 60
 DEFAULT_SHOW_SECONDS = 10
+MAX_SHOW_SECONDS = 60
+# The service keeps a pushed program for one hour at most. A colour or an effect
+# from Home Assistant stays until you change it, so the bridge sends it again
+# before the hour ends.
+HOLD_SECONDS = float(os.environ.get("SIDEPULSE_HOLD_SECONDS", "3600"))
+RENEW_SECONDS = HOLD_SECONDS * 5 / 6
+DEVICE_NAMES = ("sidepulse", "pulsedot")  # The Dot mounts as PulseDot.
+BRIGHTNESS = re.compile(r"^\s*brightness\s+\d+\s*$", re.I | re.M)
 SOLID, CUSTOM = "Solid", "Custom"
 
 
@@ -92,10 +104,17 @@ def warn_once(message: str) -> None:
     print(f"sidepulse-mqtt: {message}", file=sys.stderr, flush=True)
 
 
+class Device(NamedTuple):
+    target: Path  # The LEDS.LED file of the mounted device.
+    program: str
+    led_count: int
+
+
 def last_record(path: Path) -> dict | None:
     """Return the newest complete record of the status history, or None."""
-    # NOTE: reads the file that the Python app writes for its History tab. After the
-    # Rust cutover, read the service state instead (inteliwear/sidepulse#55).
+    # NOTE: reads the file that the SidePulse service writes for the History tab,
+    # every 15 s. After the Rust cutover, read the service state instead
+    # (inteliwear/sidepulse#55).
     try:
         with path.open("rb") as file:
             file.seek(max(0, file.seek(0, os.SEEK_END) - 65536))
@@ -130,14 +149,14 @@ def state_payload(record: dict) -> str:
     )
 
 
-def device_program() -> tuple[str, int] | None:
-    """Return the program on the mounted SidePulse device and its LED count, or None."""
+def mounted_device() -> Device | None:
+    """Return the mounted SidePulse device with the program that it plays, or None."""
     try:
         for volume in sorted(VOLUMES.iterdir()):
             target = volume / "LEDS.LED"
-            if volume.name.lower().startswith("sidepulse") and target.is_file():
+            if volume.name.lower().startswith(DEVICE_NAMES) and target.is_file():
                 led_count = 2 if "dot" in volume.name.lower() else 8
-                return target.read_text(errors="replace"), led_count
+                return Device(target, target.read_text(errors="replace"), led_count)
     except OSError as exc:
         warn_once(f"cannot read the device: {exc}")
     return None
@@ -160,11 +179,20 @@ def builtin_animations(led_count: int) -> dict[str, str]:
 
 
 def body(program: str) -> str:
-    """Return the program without brightness lines, which the app adds."""
+    """Return the program without brightness lines, which the service adds."""
     lines = (line.strip() for line in program.splitlines())
-    return "\n".join(
-        line for line in lines if line and not re.fullmatch(r"brightness\s+\d+", line, re.I)
-    )
+    return "\n".join(line for line in lines if line and not BRIGHTNESS.fullmatch(line))
+
+
+def with_brightness(program: str, current: str) -> str:
+    """Give a program the brightness line of the program that the device plays."""
+    # The service writes its own programs with the brightness from the SidePulse
+    # settings, but it writes a pushed program as it is. Without this line a pushed
+    # colour would ignore the brightness setting.
+    line = BRIGHTNESS.search(current)
+    if line is None or BRIGHTNESS.search(program):
+        return program
+    return f"{line.group().strip()}\n{program}"
 
 
 def solid_program(rgb: str) -> str:
@@ -187,31 +215,60 @@ def light_state(program: str, animations: dict[str, str]) -> dict:
     }
 
 
-def light_request(command: dict, animations: dict[str, str]) -> dict:
-    """Turn a Home Assistant light command into a request for the app socket."""
+def light_program(command: dict, animations: dict[str, str]) -> str | None:
+    """Turn a Home Assistant light command into the program to hold, or None."""
     if command.get("state") == "OFF":
-        program = "off\n"
-    elif "color" in command:
+        return "off\n"
+    if "color" in command:
         rgb = "".join(f"{int(command['color'][key]):02X}" for key in "rgb")
-        program = solid_program(rgb)
-    elif command.get("effect") in animations:
-        program = animations[command["effect"]]
-    else:
-        return {"command": "clear"}  # A plain "on" returns the device to live status.
-    return {"command": "show", "program": program, "hold": True}
+        return solid_program(rgb)
+    if command.get("effect") in animations:
+        return animations[command["effect"]]
+    return None  # A plain "on" returns the device to live status.
 
 
-def app_request(message: dict) -> str:
-    """Send one request to the app socket and return its reply."""
-    # NOTE: uses the socket commands from inteliwear/sidepulse#56. After the Rust
-    # cutover, use the interface that inteliwear/sidepulse#55 settles on.
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(2)
-        client.connect(str(STATE_DIR / "events.sock"))
-        client.sendall(json.dumps(message).encode())
-        client.shutdown(socket.SHUT_WR)
-        reply = b"".join(iter(lambda: client.recv(1024), b"")).decode(errors="replace")
-    return reply or "error: no reply, so the app has no show command yet"
+def alert(text: str) -> tuple[str, float]:
+    """Read an alert from the show topic: the program and the seconds that it plays."""
+    plain = not text.lstrip().startswith("{")
+    request = {"program": text} if plain else json.loads(text)
+    seconds = float(request.get("seconds", DEFAULT_SHOW_SECONDS))
+    return request["program"], min(max(seconds, 1), MAX_SHOW_SECONDS)
+
+
+def service_socket() -> Path:
+    """Return the path of the socket of the SidePulse service."""
+    # A Unix socket path has a length limit. The service moves the socket to /tmp
+    # when the state directory is too long, and this is its rule.
+    path = STATE_DIR / "program-status.sock"
+    if len(str(path).encode()) > 96:
+        digest = hashlib.sha256(str(path).encode()).hexdigest()[:16]
+        return Path("/tmp") / f"sidepulse-status-{os.getuid()}" / f"{digest}.sock"
+    return path
+
+
+def write_led(program: str, target: Path, seconds: float) -> str:
+    """Ask the service to write a program to the device and to keep it for some seconds.
+
+    After that time the service writes the live agent status again. A time of 0
+    therefore returns the device to live status at once.
+    """
+    # NOTE: write_led is the command that the SidePulse menu uses for a preview. It
+    # is not a documented interface for other programs. After the Rust cutover, use
+    # the interface that inteliwear/sidepulse#55 settles on.
+    message = {"v": 1, "type": "write_led", "program": program, "target": str(target),
+               "hold_seconds": seconds}
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(5)
+            client.connect(str(service_socket()))
+            client.sendall(json.dumps(message).encode())
+            client.shutdown(socket.SHUT_WR)
+            reply = json.loads(b"".join(iter(lambda: client.recv(4096), b"")) or b"{}")
+    except (FileNotFoundError, ConnectionRefusedError):
+        return "error: the SidePulse service does not run"
+    except (OSError, ValueError) as exc:
+        return f"error: {exc}"
+    return "ok" if reply.get("ok") else f"error: {reply.get('error', 'no reply')}"
 
 
 def main() -> int:
@@ -219,18 +276,59 @@ def main() -> int:
     if not host:
         print("sidepulse-mqtt: set MQTT_HOST", file=sys.stderr)
         return 2
-    device = device_program()
-    animations = builtin_animations(device[1] if device else 8)
+    device = mounted_device()
+    animations = builtin_animations(device.led_count if device else 8)
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=NODE)
     if os.environ.get("MQTT_USERNAME"):
         client.username_pw_set(os.environ["MQTT_USERNAME"], os.environ.get("MQTT_PASSWORD"))
     client.will_set(AVAILABILITY, "offline", qos=1, retain=True)
     sent: dict[str, str] = {}
+    # The program that Home Assistant holds on the device, and the time to send it
+    # again. Empty while the device shows live status. MQTT messages arrive on
+    # another thread, so the lock guards it.
+    hold: dict = {}
+    lock = threading.Lock()
 
     def publish(topic: str, payload: str) -> None:
         if sent.get(topic) != payload:
             client.publish(topic, payload, qos=1, retain=True)
             sent[topic] = payload
+
+    def push(program: str | None, seconds: float, keep: bool = False) -> tuple[str, str]:
+        """Write a program through the service. Return the reply and the program.
+
+        With keep, the bridge sends the program again before the service drops it.
+        """
+        device = mounted_device()
+        if device is None:
+            return "error: no SidePulse device is mounted", ""
+        if program is None:
+            # Back to live status. The service needs a program even for a hold of
+            # 0 s, so write the current one again. It then replaces it.
+            program, seconds = device.program, 0
+        else:
+            program = with_brightness(program, device.program)
+        with lock:
+            reply = write_led(program, device.target, seconds)
+            hold.clear()  # Every push ends the hold before it.
+            if reply == "ok" and keep and seconds:
+                hold.update(program=program, renew=time.monotonic() + RENEW_SECONDS)
+        return reply, program
+
+    def keep_hold(device: Device) -> None:
+        """Send the held program again before the service drops it. Needs the lock."""
+        if not hold:
+            return
+        if body(device.program) != body(hold["program"]):
+            # The service or the SidePulse menu wrote the device. The hold is over.
+            hold.clear()
+        elif time.monotonic() >= hold["renew"]:
+            reply = write_led(hold["program"], device.target, HOLD_SECONDS)
+            if reply == "ok":
+                hold["renew"] = time.monotonic() + RENEW_SECONDS
+            else:
+                hold.clear()
+                print(f"sidepulse-mqtt: hold: {reply}", file=sys.stderr, flush=True)
 
     def on_connect(client, _userdata, _flags, reason_code, _properties) -> None:
         if reason_code.is_failure:
@@ -248,19 +346,16 @@ def main() -> int:
         kind = "light" if message.topic == LIGHT_SET else "show"
         try:
             if kind == "light":
-                request = light_request(json.loads(text), animations)
+                held = light_program(json.loads(text), animations)
+                reply, program = push(held, HOLD_SECONDS, keep=True)
             else:
-                plain = not text.lstrip().startswith("{")
-                alert = {"program": text} if plain else json.loads(text)
-                seconds = float(alert.get("seconds", DEFAULT_SHOW_SECONDS))
-                request = {"command": "show", "program": alert["program"], "seconds": seconds}
-            reply = app_request(request)
+                reply, program = push(*alert(text))
         except Exception as exc:
             reply = f"error: {exc}"
         else:
-            if kind == "light" and reply == "ok" and "program" in request:
+            if kind == "light" and reply == "ok" and held is not None:
                 # Show the push at once. The next poll reads the device again.
-                state = light_state(request["program"], animations)
+                state = light_state(program, animations)
                 publish(LIGHT, json.dumps(state, sort_keys=True))
         print(f"sidepulse-mqtt: {kind}: {reply}", file=sys.stderr, flush=True)
 
@@ -272,18 +367,25 @@ def main() -> int:
     client.connect_async(host, int(os.environ.get("MQTT_PORT", "1883")))
     client.loop_start()
     while True:
+        # A hold must outlive a broker that is down for a while, so this does not
+        # wait for the connection. The lock stops a push from landing between the
+        # read of the device and the check of the hold.
+        with lock:
+            device = mounted_device()
+            if device:
+                keep_hold(device)
         if client.is_connected():
             record = last_record(STATE_DIR / "status-history.jsonl")
             fresh = record is not None and is_fresh(record)
             publish(AVAILABILITY, "online" if fresh else "offline")
             if fresh:
                 publish(STATE, state_payload(record))
-            device = device_program()
             publish(LIGHT_AVAILABILITY, "online" if device else "offline")
             if device:
-                publish(LIGHT, json.dumps(light_state(device[0], animations), sort_keys=True))
+                state = light_state(device.program, animations)
+                publish(LIGHT, json.dumps(state, sort_keys=True))
                 # Blueprints read show_topic, so users pick the light, not a topic.
-                attributes = {"program": device[0], "show_topic": SHOW}
+                attributes = {"program": device.program, "show_topic": SHOW}
                 publish(LIGHT_ATTRIBUTES, json.dumps(attributes))
         time.sleep(POLL_SECONDS)
 

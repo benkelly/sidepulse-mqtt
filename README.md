@@ -1,14 +1,14 @@
 # sidepulse-mqtt
 
-This bridge shows the agent status and the LEDs of a [SidePulse](https://sidepulse.io) device in Home Assistant. Home Assistant can also control the LEDs. The bridge runs on the Mac with the SidePulse menu-bar app, and it connects to your MQTT broker.
+This bridge shows the agent status and the LEDs of a [SidePulse](https://sidepulse.io) device in Home Assistant. Home Assistant can also control the LEDs. The bridge runs on the Mac with SidePulse, and it connects to your MQTT broker.
 
 ```mermaid
 flowchart LR
     HA[Home Assistant] <-->|MQTT| Broker[MQTT broker]
     Broker <-->|MQTT| Bridge[sidepulse-mqtt]
-    Bridge -->|show, clear| App[SidePulse app]
-    App -->|status history| Bridge
-    App -->|writes LEDS.LED| Device[SidePulse device]
+    Bridge -->|LED programs| Service[SidePulse service]
+    Service -->|status history| Bridge
+    Service -->|writes LEDS.LED| Device[SidePulse device]
     Device -->|current program| Bridge
 ```
 
@@ -24,7 +24,7 @@ MQTT discovery adds one device, "SidePulse <Mac name>", with three entities:
 | Entity | Type | What it shows |
 | --- | --- | --- |
 | Agent status | Sensor | Idle, Working, Ask, or Done, as in the SidePulse menu |
-| Needs input | Binary sensor | On while an agent waits for you |
+| Needs input | Binary sensor | On while an agent waits for you or stopped on an error. SidePulse shows both as Ask. |
 | LEDs | Light | The colour and the animation on the device. The `program` attribute holds the full LED program, and `show_topic` holds the topic for alerts. |
 
 Use the LEDs light to control the device:
@@ -36,18 +36,20 @@ Use the LEDs light to control the device:
 | Turn off | LEDs dark, until you change it |
 | Turn on, with no colour or effect | Live agent status again |
 
-While a colour or an effect holds, the LEDs show no agent status. The Needs input sensor still works, because it reads the agent status, not the LEDs. A newer push, a lid animation, a disconnect in the SidePulse menu, or an app restart also ends a hold.
+While a colour or an effect holds, the LEDs show no agent status. The Needs input sensor still works, because it reads the agent status, not the LEDs. A newer push, an alert, a disconnect in the SidePulse menu, or a restart of the SidePulse service also ends a hold.
+
+SidePulse keeps a pushed program for one hour at most. The bridge therefore sends a held colour or effect again every 50 minutes. An animation starts from its beginning at that moment.
 
 For a short alert, publish to the `show` topic. An alert plays for 10 s by default. Then the device shows live status again.
 
 ## Requirements
 
-- macOS, with the SidePulse menu-bar app from [inteliwear/sidepulse](https://github.com/inteliwear/sidepulse) and a SidePulse Pro or Dot.
+- macOS, with SidePulse from [inteliwear/sidepulse](https://github.com/inteliwear/sidepulse) and a SidePulse Pro or Dot.
 - [uv](https://docs.astral.sh/uv/).
 - An MQTT broker, for example the Mosquitto add-on.
 - Home Assistant with the MQTT integration and the default discovery prefix, `homeassistant`.
 
-The two sensors and the LED state work with the current SidePulse app. LED control and alerts need the `show` and `clear` socket commands from [inteliwear/sidepulse#56](https://github.com/inteliwear/sidepulse/pull/56). That PR is not merged yet.
+LED control and alerts need the SidePulse background service. Upstream added it on 10 November 2026. With an older SidePulse, the two sensors and the LED state still work, but Home Assistant cannot change the LEDs.
 
 ## Install
 
@@ -144,7 +146,8 @@ The log is `~/Library/Logs/sidepulse-mqtt.log`.
 | --- | --- | --- |
 | `cannot reach the broker, retrying` | macOS blocks local network access, or the broker is down. | Turn on `uv` in System Settings → Privacy & Security → Local Network. Then restart the bridge. |
 | `connect failed: …` | The broker rejects the login. | Store the correct password. Then restart the bridge. |
-| `show: error: no reply, so the app has no show command yet` | The SidePulse app has no `show` command. | Install a SidePulse version with inteliwear/sidepulse#56. |
+| `error: the SidePulse service does not run` | The SidePulse background service is stopped, or SidePulse is older than 10 November 2026. | Run `sidepulse service start`. If the command is unknown, update SidePulse. |
+| `error: no SidePulse device is mounted` | The device is not plugged in, or macOS has not mounted it. | Plug the device in. Check that its volume is in Finder. |
 | `cannot read the device: …` | macOS blocks access to the SidePulse volume. | Allow `uv` to access removable volumes in System Settings → Privacy & Security. |
 
 The Local Network permission belongs to the exact `uv` binary. After uv updates itself, macOS can block the bridge again.
@@ -163,15 +166,23 @@ security add-generic-password -U -s sidepulse-mqtt -a "$USER" -w
 
 ## Test
 
-`check_bridge.py` runs the bridge against a real broker. It uses a temporary status history, socket, device volume, and animations. It does not touch your SidePulse app or device.
+Both checks need an MQTT broker without a login on `127.0.0.1:18830`, and both use temporary folders. They do not touch your SidePulse or your device.
 
 ```sh
 docker run -d --rm --name sidepulse-mqtt-check -p 127.0.0.1:18830:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
 ./check_bridge.py
+SIDEPULSE_BIN=~/.local/bin/sidepulse ./check_service.py
 docker stop sidepulse-mqtt-check
 ```
 
-Expected output: ten lines that start with `ok`, and then `ok: all checks passed`.
+| Check | What it runs the bridge against | Time |
+| --- | --- | --- |
+| `check_bridge.py` | A fake SidePulse: a status history, a service socket, a device folder, and animations. It also tests the functions of the bridge directly. | About 80 s |
+| `check_service.py` | A real SidePulse service, which it starts in a temporary home folder. It checks the sensors, an alert, a colour that holds for longer than the service keeps one push, and the return to live status. | About 2 min |
+
+Each check prints one line that starts with `ok` for each step, and then `ok: all checks passed`. `check_service.py` is tested on Linux only, which is where CI runs it.
+
+CI runs both on every pull request. It runs `check_service.py` against three SidePulse versions: the first commit with the background service, a later commit, and `main`. The `main` run repeats every Monday, so a breaking change in SidePulse fails here first. When that happens, fix the bridge and add the new commit to `.github/workflows/ci.yml`.
 
 ## Remove
 
@@ -186,7 +197,8 @@ To remove the device from Home Assistant, delete it in Settings → Devices & se
 
 ## Limits
 
-- The bridge reads the status history of the Python SidePulse app. The Rust migration in [inteliwear/sidepulse#52](https://github.com/inteliwear/sidepulse/pull/52) changes this interface. See [inteliwear/sidepulse#55](https://github.com/inteliwear/sidepulse/issues/55).
+- The bridge reads the status history of SidePulse, and it changes the LEDs with the `write_led` command that the SidePulse menu uses for a preview. SidePulse does not document either one for other programs. The Rust migration in [inteliwear/sidepulse#52](https://github.com/inteliwear/sidepulse/pull/52) can change both. See [inteliwear/sidepulse#55](https://github.com/inteliwear/sidepulse/issues/55).
+- SidePulse writes the status history every 15 s, so the two sensors can be up to 20 s late.
 - The light shows the first colour of the program. An animation with more colours shows only one colour on the tile.
 - Effect names come from the file names of the app animations, for example "Kitt" for KITT Scanner.
 - The brightness slider in Home Assistant sends a darker colour. The device brightness in SidePulse still limits the output.
